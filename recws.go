@@ -48,6 +48,7 @@ type RecConn struct {
 	NonVerbose bool
 
 	isConnected bool
+	termChan    chan TerminationReason
 	mu          sync.RWMutex
 	url         string
 	reqHeader   http.Header
@@ -58,10 +59,23 @@ type RecConn struct {
 	*websocket.Conn
 }
 
+const (
+	reasonClose TerminationReason = iota
+	reasonCloseAndReconnect
+	reasonShutdown
+)
+
+type TerminationReason int
+
+// closeAndReconnect will try to reconnect.
+func (rc *RecConn) closeAndReconnect() {
+	rc.close()
+	go rc.connect()
+}
+
 // CloseAndReconnect will try to reconnect.
 func (rc *RecConn) CloseAndReconnect() {
-	rc.Close()
-	go rc.connect()
+	rc.termChan <- reasonCloseAndReconnect
 }
 
 // setIsConnected sets state for isConnected
@@ -79,16 +93,22 @@ func (rc *RecConn) getConn() *websocket.Conn {
 	return rc.Conn
 }
 
-// Close closes the underlying network connection without
-// sending or waiting for a close frame.
-func (rc *RecConn) Close() {
+func (rc *RecConn) close() {
 	if rc.getConn() != nil {
 		rc.mu.Lock()
-		rc.Conn.Close()
+		if err := rc.Conn.Close(); err != nil {
+			log.Println(err)
+		}
 		rc.mu.Unlock()
 	}
 
 	rc.setIsConnected(false)
+}
+
+// Close closes the underlying network connection without
+// sending or waiting for a close frame.
+func (rc *RecConn) Close() {
+	rc.termChan <- reasonClose
 }
 
 // Shutdown gracefully closes the connection by sending the websocket.CloseMessage.
@@ -99,8 +119,10 @@ func (rc *RecConn) Shutdown(writeWait time.Duration) {
 	if err != nil && err != websocket.ErrCloseSent {
 		// If close message could not be sent, then close without the handshake.
 		log.Printf("Shutdown: %v", err)
-		rc.Close()
+		rc.termChan <- reasonClose
+		return
 	}
+	rc.termChan <- reasonShutdown
 }
 
 // ReadMessage is a helper method for getting a reader
@@ -112,11 +134,11 @@ func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
 	if rc.IsConnected() {
 		messageType, message, err = rc.Conn.ReadMessage()
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close()
+			rc.termChan <- reasonClose
 			return messageType, message, nil
 		}
 		if err != nil {
-			rc.CloseAndReconnect()
+			rc.termChan <- reasonCloseAndReconnect
 		}
 	}
 
@@ -134,11 +156,11 @@ func (rc *RecConn) WriteMessage(messageType int, data []byte) error {
 		err = rc.Conn.WriteMessage(messageType, data)
 		rc.mu.Unlock()
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close()
+			rc.termChan <- reasonClose
 			return nil
 		}
 		if err != nil {
-			rc.CloseAndReconnect()
+			rc.termChan <- reasonCloseAndReconnect
 		}
 	}
 
@@ -158,11 +180,11 @@ func (rc *RecConn) WriteJSON(v interface{}) error {
 		err = rc.Conn.WriteJSON(v)
 		rc.mu.Unlock()
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close()
+			rc.termChan <- reasonClose
 			return nil
 		}
 		if err != nil {
-			rc.CloseAndReconnect()
+			rc.termChan <- reasonCloseAndReconnect
 		}
 	}
 
@@ -181,11 +203,11 @@ func (rc *RecConn) ReadJSON(v interface{}) error {
 	if rc.IsConnected() {
 		err = rc.Conn.ReadJSON(v)
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close()
+			rc.termChan <- reasonClose
 			return nil
 		}
 		if err != nil {
-			rc.CloseAndReconnect()
+			rc.termChan <- reasonCloseAndReconnect
 		}
 	}
 
@@ -385,13 +407,14 @@ func (rc *RecConn) writeControlPingMessage() error {
 
 func (rc *RecConn) keepAlive() {
 	var (
-		keepAliveResponse = new(keepAliveResponse)
-		ticker            = time.NewTicker(rc.getKeepAliveTimeout())
+		lastResponse = time.Now()
+		ticker       = time.NewTicker(rc.getKeepAliveTimeout())
+		pongChan     = make(chan time.Time)
 	)
 
 	rc.mu.Lock()
 	rc.Conn.SetPongHandler(func(msg string) error {
-		keepAliveResponse.setLastResponse()
+		pongChan <- time.Now()
 		return nil
 	})
 	rc.mu.Unlock()
@@ -400,18 +423,28 @@ func (rc *RecConn) keepAlive() {
 		defer ticker.Stop()
 
 		for {
-			if !rc.IsConnected() {
+			if !rc.isConnected {
 				continue
 			}
 
-			if err := rc.writeControlPingMessage(); err != nil {
-				log.Println(err)
-			}
-
-			<-ticker.C
-			if time.Since(keepAliveResponse.getLastResponse()) > rc.getKeepAliveTimeout() {
-				rc.CloseAndReconnect()
-				return
+			select {
+			case lastResponse = <-pongChan:
+				if time.Since(lastResponse) > rc.getKeepAliveTimeout() {
+					rc.termChan <- reasonCloseAndReconnect
+					return
+				}
+				if !rc.getNonVerbose() {
+					log.Println("keepAlive: Received pong message at:", lastResponse)
+				}
+			case <-ticker.C:
+				if err := rc.writeControlPingMessage(); err != nil {
+					log.Println(err)
+					rc.termChan <- reasonCloseAndReconnect
+					return
+				}
+				if !rc.getNonVerbose() {
+					log.Println("keepAlive: Wrote ping message at:", time.Now())
+				}
 			}
 		}
 	}()
@@ -429,6 +462,7 @@ func (rc *RecConn) connect() {
 		rc.Conn = wsConn
 		rc.dialErr = err
 		rc.isConnected = err == nil
+		rc.termChan = make(chan TerminationReason)
 		rc.httpResp = httpResp
 		rc.mu.Unlock()
 
@@ -450,6 +484,8 @@ func (rc *RecConn) connect() {
 				rc.keepAlive()
 			}
 
+			go rc.terminationHandler()
+
 			return
 		}
 
@@ -459,6 +495,18 @@ func (rc *RecConn) connect() {
 		}
 
 		time.Sleep(nextItvl)
+	}
+}
+
+// terminationHandler handles the termination process
+func (rc *RecConn) terminationHandler() {
+	switch <-rc.termChan {
+	case reasonClose:
+		rc.close()
+	case reasonCloseAndReconnect:
+		rc.closeAndReconnect()
+	case reasonShutdown:
+		// Clean exit reason after successfully closing the connection by sending a websocket.CloseMessage
 	}
 }
 
