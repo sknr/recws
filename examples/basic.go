@@ -9,13 +9,14 @@ import (
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
-	ws := recws.RecConn{
-		KeepAliveTimeout: 10 * time.Second,
-	}
+	ws := recws.New(
+		recws.WithKeepAliveTimeout(10*time.Second),
+		recws.WithVerbose(),
+	)
 	ws.Dial("wss://echo.websocket.org", nil)
 
 	go func() {
-		time.Sleep(2 * time.Second)
+		time.Sleep(10 * time.Second)
 		cancel()
 	}()
 
@@ -28,6 +29,7 @@ func main() {
 		default:
 			if !ws.IsConnected() {
 				log.Printf("Websocket disconnected %s", ws.GetURL())
+				time.Sleep(time.Second)
 				continue
 			}
 
