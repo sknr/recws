@@ -16,12 +16,18 @@ import (
 	"github.com/jpillora/backoff"
 )
 
+const (
+	reasonClose TerminationReason = iota
+	reasonCloseAndReconnect
+	reasonShutdown
+)
+
 // ErrNotConnected is returned when the application read/writes
 // a message and the connection is closed
 var ErrNotConnected = errors.New("websocket: not connected")
 
-// The RecConn type represents a Reconnecting WebSocket connection.
-type RecConn struct {
+// The recConn type represents a Reconnecting WebSocket connection.
+type recConn struct {
 	// Configurable options
 
 	// recIntervalMin specifies the initial reconnecting interval,
@@ -66,20 +72,14 @@ type RecConn struct {
 	*websocket.Conn
 }
 
-const (
-	reasonClose TerminationReason = iota
-	reasonCloseAndReconnect
-	reasonShutdown
-)
-
 type (
 	TerminationReason int
-	RecConnOption     func(conn *RecConn)
+	RecConnOption     func(conn *recConn)
 )
 
-func New(opts ...RecConnOption) *RecConn {
-	// Create RecConn with default values.
-	rc := &RecConn{
+func New(opts ...RecConnOption) *recConn {
+	// Create recConn with default values.
+	rc := &recConn{
 		recIntervalMin:    2 * time.Second,
 		recIntervalMax:    30 * time.Second,
 		recIntervalFactor: 1.5,
@@ -113,7 +113,7 @@ func New(opts ...RecConnOption) *RecConn {
 
 // WithReconnectInterval configures the reconnection interval.
 func WithReconnectInterval(recIntervalMin, recIntervalMax time.Duration, recIntervalFactor float64) RecConnOption {
-	return func(rc *RecConn) {
+	return func(rc *recConn) {
 		rc.recIntervalMin = recIntervalMin
 		rc.recIntervalMax = recIntervalMax
 		rc.recIntervalFactor = recIntervalFactor
@@ -122,49 +122,49 @@ func WithReconnectInterval(recIntervalMin, recIntervalMax time.Duration, recInte
 
 // WithHandshakeTimeout configures the handshake timeout.
 func WithHandshakeTimeout(timeout time.Duration) RecConnOption {
-	return func(rc *RecConn) {
+	return func(rc *recConn) {
 		rc.handshakeTimeout = timeout
 	}
 }
 
 // WithKeepAliveTimeout configures the keep alive timeout.
 func WithKeepAliveTimeout(timeout time.Duration) RecConnOption {
-	return func(rc *RecConn) {
+	return func(rc *recConn) {
 		rc.keepAliveTimeout = timeout
 	}
 }
 
 // WithWriteTimeout configures the websocket write timeout.
 func WithWriteTimeout(timeout time.Duration) RecConnOption {
-	return func(rc *RecConn) {
+	return func(rc *recConn) {
 		rc.writeTimeout = timeout
 	}
 }
 
 // WithProxy configures the websocket proxy.
 func WithProxy(proxy func(*http.Request) (*url.URL, error)) RecConnOption {
-	return func(rc *RecConn) {
+	return func(rc *recConn) {
 		rc.proxy = proxy
 	}
 }
 
 // WithTLSConfig configures the TLSConfig to be used on the websocket connection.
 func WithTLSConfig(tlsConfig *tls.Config) RecConnOption {
-	return func(rc *RecConn) {
+	return func(rc *recConn) {
 		rc.tlsClientConfig = tlsConfig
 	}
 }
 
 // WithSubscribeHandler configures the subscribe-handler function to be called after successful websocket connection.
 func WithSubscribeHandler(handler func() error) RecConnOption {
-	return func(rc *RecConn) {
+	return func(rc *recConn) {
 		rc.subscribeHandler = handler
 	}
 }
 
 // WithVerbose configures the visibility of connecting/reconnecting messages.
 func WithVerbose() RecConnOption {
-	return func(rc *RecConn) {
+	return func(rc *recConn) {
 		rc.verbose = true
 	}
 }
@@ -178,7 +178,7 @@ func WithVerbose() RecConnOption {
 // the origin (Origin), subprotocols (Sec-WebSocket-Protocol) and cookies
 // (Cookie). Use GetHTTPResponse() method for the response. Header to get
 // the selected subprotocol (Sec-WebSocket-Protocol) and cookies (Set-Cookie).
-func (rc *RecConn) Dial(urlStr string, reqHeader http.Header) {
+func (rc *recConn) Dial(urlStr string, reqHeader http.Header) {
 	urlStr, err := rc.parseURL(urlStr)
 
 	if err != nil {
@@ -202,7 +202,7 @@ func (rc *RecConn) Dial(urlStr string, reqHeader http.Header) {
 }
 
 // GetURL returns current connection url
-func (rc *RecConn) GetURL() string {
+func (rc *recConn) GetURL() string {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
@@ -212,7 +212,7 @@ func (rc *RecConn) GetURL() string {
 // GetHTTPResponse returns the http response from the handshake.
 // Useful when WebSocket handshake fails,
 // so that callers can handle redirects, authentication, etc.
-func (rc *RecConn) GetHTTPResponse() *http.Response {
+func (rc *recConn) GetHTTPResponse() *http.Response {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
@@ -221,7 +221,7 @@ func (rc *RecConn) GetHTTPResponse() *http.Response {
 
 // GetDialError returns the last dialer error.
 // nil on successful connection.
-func (rc *RecConn) GetDialError() error {
+func (rc *recConn) GetDialError() error {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
@@ -229,7 +229,7 @@ func (rc *RecConn) GetDialError() error {
 }
 
 // IsConnected returns the WebSocket connection state
-func (rc *RecConn) IsConnected() bool {
+func (rc *recConn) IsConnected() bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
@@ -238,19 +238,19 @@ func (rc *RecConn) IsConnected() bool {
 
 // Close closes the underlying network connection without
 // sending or waiting for a close frame.
-func (rc *RecConn) Close() {
+func (rc *recConn) Close() {
 	rc.termChan <- reasonClose
 }
 
 // CloseAndReconnect will try to reconnect.
-func (rc *RecConn) CloseAndReconnect() {
+func (rc *recConn) CloseAndReconnect() {
 	rc.termChan <- reasonCloseAndReconnect
 }
 
 // Shutdown gracefully closes the connection by sending the websocket.CloseMessage.
 // The global option writeTimeout defines the duration after which the write
 // operation get canceled. (Can be set WithWriteTimeout())
-func (rc *RecConn) Shutdown() {
+func (rc *recConn) Shutdown() {
 	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
 	err := rc.WriteControl(websocket.CloseMessage, msg, time.Now().Add(rc.writeTimeout))
 	if err != nil && err != websocket.ErrCloseSent {
@@ -266,7 +266,7 @@ func (rc *RecConn) Shutdown() {
 // using NextReader and reading from that reader to a buffer.
 //
 // If the connection is closed ErrNotConnected is returned
-func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
+func (rc *recConn) ReadMessage() (messageType int, message []byte, err error) {
 	err = ErrNotConnected
 	if rc.IsConnected() {
 		messageType, message, err = rc.Conn.ReadMessage()
@@ -286,7 +286,7 @@ func (rc *RecConn) ReadMessage() (messageType int, message []byte, err error) {
 // writing the message and closing the writer.
 //
 // If the connection is closed ErrNotConnected is returned
-func (rc *RecConn) WriteMessage(messageType int, data []byte) error {
+func (rc *recConn) WriteMessage(messageType int, data []byte) error {
 	err := ErrNotConnected
 	if rc.IsConnected() {
 		rc.mu.Lock()
@@ -310,7 +310,7 @@ func (rc *RecConn) WriteMessage(messageType int, data []byte) error {
 // conversion of Go values to JSON.
 //
 // If the connection is closed ErrNotConnected is returned
-func (rc *RecConn) WriteJSON(v interface{}) error {
+func (rc *recConn) WriteJSON(v interface{}) error {
 	err := ErrNotConnected
 	if rc.IsConnected() {
 		rc.mu.Lock()
@@ -335,7 +335,7 @@ func (rc *RecConn) WriteJSON(v interface{}) error {
 // about the conversion of JSON to a Go value.
 //
 // If the connection is closed ErrNotConnected is returned
-func (rc *RecConn) ReadJSON(v interface{}) error {
+func (rc *recConn) ReadJSON(v interface{}) error {
 	err := ErrNotConnected
 	if rc.IsConnected() {
 		err = rc.Conn.ReadJSON(v)
@@ -356,27 +356,27 @@ func (rc *RecConn) ReadJSON(v interface{}) error {
 /////////////////////
 
 // closeAndReconnect will try to reconnect.
-func (rc *RecConn) closeAndReconnect() {
+func (rc *recConn) closeAndReconnect() {
 	rc.close()
 	go rc.connect()
 }
 
 // setIsConnected sets state for isConnected
-func (rc *RecConn) setIsConnected(state bool) {
+func (rc *recConn) setIsConnected(state bool) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
 	rc.isConnected = state
 }
 
-func (rc *RecConn) getConn() *websocket.Conn {
+func (rc *recConn) getConn() *websocket.Conn {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
 	return rc.Conn
 }
 
-func (rc *RecConn) close() {
+func (rc *recConn) close() {
 	if rc.getConn() != nil {
 		rc.mu.Lock()
 		if err := rc.Conn.Close(); err != nil {
@@ -388,14 +388,14 @@ func (rc *RecConn) close() {
 	rc.setIsConnected(false)
 }
 
-func (rc *RecConn) setURL(url string) {
+func (rc *recConn) setURL(url string) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
 	rc.url = url
 }
 
-func (rc *RecConn) setReqHeader(reqHeader http.Header) {
+func (rc *recConn) setReqHeader(reqHeader http.Header) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
@@ -403,7 +403,7 @@ func (rc *RecConn) setReqHeader(reqHeader http.Header) {
 }
 
 // parseURL parses current url
-func (rc *RecConn) parseURL(urlStr string) (string, error) {
+func (rc *recConn) parseURL(urlStr string) (string, error) {
 	if urlStr == "" {
 		return "", errors.New("dial: url cannot be empty")
 	}
@@ -425,21 +425,21 @@ func (rc *RecConn) parseURL(urlStr string) (string, error) {
 	return urlStr, nil
 }
 
-func (rc *RecConn) getHandshakeTimeout() time.Duration {
+func (rc *recConn) getHandshakeTimeout() time.Duration {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
 	return rc.handshakeTimeout
 }
 
-func (rc *RecConn) isVerbose() bool {
+func (rc *recConn) isVerbose() bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
 	return rc.verbose
 }
 
-func (rc *RecConn) getBackoff() *backoff.Backoff {
+func (rc *recConn) getBackoff() *backoff.Backoff {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
@@ -451,28 +451,28 @@ func (rc *RecConn) getBackoff() *backoff.Backoff {
 	}
 }
 
-func (rc *RecConn) hasSubscribeHandler() bool {
+func (rc *recConn) hasSubscribeHandler() bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
 	return rc.subscribeHandler != nil
 }
 
-func (rc *RecConn) getKeepAliveTimeout() time.Duration {
+func (rc *recConn) getKeepAliveTimeout() time.Duration {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
 	return rc.keepAliveTimeout
 }
 
-func (rc *RecConn) writeControlPingMessage() error {
+func (rc *recConn) writeControlPingMessage() error {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
 	return rc.Conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(rc.writeTimeout))
 }
 
-func (rc *RecConn) keepAlive() {
+func (rc *recConn) keepAlive() {
 	var (
 		lastResponse = time.Now()
 		ticker       = time.NewTicker(rc.getKeepAliveTimeout())
@@ -511,7 +511,7 @@ func (rc *RecConn) keepAlive() {
 	}()
 }
 
-func (rc *RecConn) connect() {
+func (rc *recConn) connect() {
 	b := rc.getBackoff()
 	rand.Seed(time.Now().UTC().UnixNano())
 
@@ -560,7 +560,7 @@ func (rc *RecConn) connect() {
 }
 
 // terminationHandler handles the termination process
-func (rc *RecConn) terminationHandler() {
+func (rc *recConn) terminationHandler() {
 	switch <-rc.termChan {
 	case reasonClose:
 		rc.close()
