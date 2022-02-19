@@ -475,12 +475,21 @@ func (rc *RecConn) writeControlPingMessage() error {
 func (rc *RecConn) keepAlive() {
 	var (
 		lastResponse = time.Now()
-		ticker       = time.NewTicker(rc.getKeepAliveTimeout())
+		ticker       = time.NewTicker((rc.getKeepAliveTimeout() * 9) / 10)
 		pongChan     = make(chan time.Time)
 	)
 
 	rc.mu.Lock()
 	rc.Conn.SetPongHandler(func(msg string) error {
+		if rc.getKeepAliveTimeout() > 0 {
+			// Set read deadline in case the tcp connection failed.
+			if err := rc.Conn.SetReadDeadline(time.Now().Add(rc.getKeepAliveTimeout())); err != nil {
+				log.Printf("Dial: cannot set read deadline %s", err.Error())
+			}
+			if rc.isVerbose() {
+				log.Printf("Dial: next read deadline %q", time.Now().Add(rc.getKeepAliveTimeout()))
+			}
+		}
 		pongChan <- time.Now()
 		return nil
 	})
@@ -528,6 +537,13 @@ func (rc *RecConn) connect() {
 		rc.mu.Unlock()
 
 		if err == nil {
+			if rc.getKeepAliveTimeout() > 0 {
+				// Set read deadline in case the tcp connection failed.
+				if err := rc.Conn.SetReadDeadline(time.Now().Add(rc.getKeepAliveTimeout())); err != nil {
+					log.Printf("Dial: cannot set read deadline %s", err.Error())
+				}
+			}
+
 			if rc.isVerbose() {
 				log.Printf("Dial: connection was successfully established with %s\n", rc.url)
 			}
@@ -536,12 +552,9 @@ func (rc *RecConn) connect() {
 				if err := rc.subscribeHandler(); err != nil {
 					log.Fatalf("Dial: connect handler failed with %s", err.Error())
 				}
-				if rc.isVerbose() {
-					log.Printf("Dial: connect handler was successfully established with %s\n", rc.url)
-				}
 			}
 
-			if rc.getKeepAliveTimeout() != 0 {
+			if rc.getKeepAliveTimeout() > 0 {
 				rc.keepAlive()
 			}
 
