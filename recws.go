@@ -54,14 +54,15 @@ type RecConn struct {
 	verbose bool
 
 	// Internal options
-	isConnected bool
-	termChan    chan TerminationReason
-	mu          sync.RWMutex
-	url         string
-	reqHeader   http.Header
-	httpResp    *http.Response
-	dialErr     error
-	dialer      *websocket.Dialer
+	isConnected  bool
+	termChan     chan TerminationReason
+	shutDownChan chan struct{}
+	mu           sync.RWMutex
+	url          string
+	reqHeader    http.Header
+	httpResp     *http.Response
+	dialErr      error
+	dialer       *websocket.Dialer
 
 	*websocket.Conn
 }
@@ -69,7 +70,6 @@ type RecConn struct {
 const (
 	reasonClose TerminationReason = iota
 	reasonCloseAndReconnect
-	reasonShutdown
 )
 
 type (
@@ -251,6 +251,10 @@ func (rc *RecConn) CloseAndReconnect() {
 // The global option writeTimeout defines the duration after which the write
 // operation get canceled. (Can be set WithWriteTimeout())
 func (rc *RecConn) Shutdown() {
+	if !rc.IsConnected() {
+		log.Println("Shutdown: connection is already closed")
+		return
+	}
 	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
 	err := rc.WriteControl(websocket.CloseMessage, msg, time.Now().Add(rc.writeTimeout))
 	if err != nil && err != websocket.ErrCloseSent {
@@ -259,7 +263,7 @@ func (rc *RecConn) Shutdown() {
 		rc.termChan <- reasonClose
 		return
 	}
-	rc.termChan <- reasonShutdown
+	time.Sleep(time.Second)
 }
 
 // ReadMessage is a helper method for getting a reader
@@ -377,7 +381,7 @@ func (rc *RecConn) getConn() *websocket.Conn {
 }
 
 func (rc *RecConn) close() {
-	if rc.getConn() != nil {
+	if rc.getConn() != nil && rc.IsConnected() {
 		rc.mu.Lock()
 		if err := rc.Conn.Close(); err != nil {
 			log.Println(err)
@@ -466,10 +470,20 @@ func (rc *RecConn) getKeepAliveTimeout() time.Duration {
 }
 
 func (rc *RecConn) writeControlPingMessage() error {
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-
-	return rc.Conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(rc.writeTimeout))
+	err := ErrNotConnected
+	if rc.IsConnected() {
+		rc.mu.Lock()
+		err = rc.Conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(rc.writeTimeout))
+		rc.mu.Unlock()
+		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+			rc.termChan <- reasonClose
+			return nil
+		}
+		if err != nil {
+			rc.termChan <- reasonCloseAndReconnect
+		}
+	}
+	return err
 }
 
 func (rc *RecConn) keepAlive() {
@@ -484,7 +498,7 @@ func (rc *RecConn) keepAlive() {
 		if rc.getKeepAliveTimeout() > 0 {
 			// Set read deadline in case the tcp connection failed.
 			if err := rc.Conn.SetReadDeadline(time.Now().Add(rc.getKeepAliveTimeout())); err != nil {
-				log.Printf("Dial: cannot set read deadline %s", err.Error())
+				log.Printf("Dial: cannot set read deadline %q", err.Error())
 			}
 			if rc.isVerbose() {
 				log.Printf("Dial: next read deadline %q", time.Now().Add(rc.getKeepAliveTimeout()))
@@ -499,10 +513,6 @@ func (rc *RecConn) keepAlive() {
 		defer ticker.Stop()
 
 		for {
-			if !rc.isConnected {
-				continue
-			}
-
 			select {
 			case lastResponse = <-pongChan:
 				if time.Since(lastResponse) > rc.getKeepAliveTimeout() {
@@ -510,9 +520,12 @@ func (rc *RecConn) keepAlive() {
 					return
 				}
 			case <-ticker.C:
+				if !rc.IsConnected() {
+					return
+				}
+
 				if err := rc.writeControlPingMessage(); err != nil {
-					log.Println(err)
-					rc.termChan <- reasonCloseAndReconnect
+					log.Printf("Dial: cannot write control ping message %q", err.Error())
 					return
 				}
 			}
@@ -533,6 +546,7 @@ func (rc *RecConn) connect() {
 		rc.dialErr = err
 		rc.isConnected = err == nil
 		rc.termChan = make(chan TerminationReason)
+		rc.shutDownChan = make(chan struct{})
 		rc.httpResp = httpResp
 		rc.mu.Unlock()
 
@@ -540,7 +554,7 @@ func (rc *RecConn) connect() {
 			if rc.getKeepAliveTimeout() > 0 {
 				// Set read deadline in case the tcp connection failed.
 				if err := rc.Conn.SetReadDeadline(time.Now().Add(rc.getKeepAliveTimeout())); err != nil {
-					log.Printf("Dial: cannot set read deadline %s", err.Error())
+					log.Printf("Dial: cannot set read deadline %q", err.Error())
 				}
 			}
 
@@ -579,7 +593,5 @@ func (rc *RecConn) terminationHandler() {
 		rc.close()
 	case reasonCloseAndReconnect:
 		rc.closeAndReconnect()
-	case reasonShutdown:
-		// Clean exit reason for successfully closing the connection after sending a websocket.CloseMessage
 	}
 }
